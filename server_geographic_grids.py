@@ -418,6 +418,7 @@ def filter_grid_connectivity(grids):
 def connect_grid_components(grids, all_roads):
     """
     Fix disconnected components within each grid by finding and adding bridge roads.
+    Iteratively connects components until grid is fully connected or no more bridges found.
 
     Args:
         grids: List of grid dictionaries with 'roads' list
@@ -435,6 +436,19 @@ def connect_grid_components(grids, all_roads):
     # Build lookup of all roads by ID for fast access
     road_lookup = {r['id']: r for r in all_roads}
 
+    # Build full graph from ALL roads once (reused for all grids)
+    print(f"  [CONNECTIVITY] Building full road network graph from {len(all_roads)} roads...")
+    full_graph = nx.Graph()
+    for road in all_roads:
+        waypoints = road.get('waypoints', [])
+        if len(waypoints) < 2:
+            continue
+        start = normalize_point(waypoints[0]['lat'], waypoints[0]['lon'])
+        end = normalize_point(waypoints[-1]['lat'], waypoints[-1]['lon'])
+        full_graph.add_edge(start, end, road_id=road['id'], length=road.get('length_meters', 0))
+
+    print(f"  [CONNECTIVITY] Full graph built: {full_graph.number_of_nodes()} nodes, {full_graph.number_of_edges()} edges")
+
     grids_fixed = 0
     total_bridges_added = 0
 
@@ -443,96 +457,104 @@ def connect_grid_components(grids, all_roads):
         if len(grid_roads) < 2:
             continue  # Can't have disconnected components with <2 roads
 
-        # Build graph from roads in this grid
-        G = nx.Graph()
-        road_to_idx = {}
+        # Iteratively fix disconnected components until fully connected
+        max_iterations = 10
+        iteration = 0
 
-        for idx, road in enumerate(grid_roads):
-            waypoints = road.get('waypoints', [])
-            if len(waypoints) < 2:
-                continue
+        while iteration < max_iterations:
+            iteration += 1
 
-            road_to_idx[road['id']] = idx
-            start = normalize_point(waypoints[0]['lat'], waypoints[0]['lon'])
-            end = normalize_point(waypoints[-1]['lat'], waypoints[-1]['lon'])
+            # Build graph from current roads in this grid
+            G = nx.Graph()
+            road_to_idx = {road['id']: idx for idx, road in enumerate(grid_roads)}
 
-            # Add edge for this road
-            G.add_edge(start, end, road_id=road['id'])
+            for road in grid_roads:
+                waypoints = road.get('waypoints', [])
+                if len(waypoints) < 2:
+                    continue
 
-        if G.number_of_nodes() == 0:
-            continue
+                start = normalize_point(waypoints[0]['lat'], waypoints[0]['lon'])
+                end = normalize_point(waypoints[-1]['lat'], waypoints[-1]['lon'])
+                G.add_edge(start, end, road_id=road['id'])
 
-        # Find connected components
-        components = list(nx.connected_components(G))
+            if G.number_of_nodes() == 0:
+                break
 
-        if len(components) <= 1:
-            continue  # Grid is already fully connected
+            # Find connected components
+            components = list(nx.connected_components(G))
 
-        print(f"    Grid {grid['id']}: {len(components)} disconnected components ({len(grid_roads)} roads)")
+            if len(components) <= 1:
+                # Grid is fully connected!
+                if iteration > 1:
+                    print(f"    Grid {grid['id']}: ✓ Fully connected after {iteration-1} iterations")
+                break
 
-        # Build graph from ALL roads to find bridges
-        full_graph = nx.Graph()
-        for road in all_roads:
-            waypoints = road.get('waypoints', [])
-            if len(waypoints) < 2:
-                continue
-            start = normalize_point(waypoints[0]['lat'], waypoints[0]['lon'])
-            end = normalize_point(waypoints[-1]['lat'], waypoints[-1]['lon'])
-            full_graph.add_edge(start, end, road_id=road['id'], length=road.get('length_meters', 0))
+            if iteration == 1:
+                print(f"    Grid {grid['id']}: {len(components)} disconnected components ({len(grid_roads)} roads, {G.number_of_nodes()} nodes)")
 
-        # Find bridges between components
-        bridges_added = []
-        components_list = list(components)
+            # Find bridges between components
+            bridges_added = []
+            components_list = sorted(components, key=len, reverse=True)
 
-        # Try to connect largest component to all others
-        largest_component = max(components_list, key=len)
+            # Try to connect largest component to all others
+            largest_component = components_list[0]
 
-        for component in components_list:
-            if component == largest_component:
-                continue
+            for component_idx, component in enumerate(components_list[1:], 1):
+                # Find shortest path between this component and largest component
+                min_path_length = float('inf')
+                best_path = None
 
-            # Find shortest path between this component and largest component
-            min_path_length = float('inf')
-            best_path = None
+                # Use all nodes for small components, sample for large ones
+                component_sample_size = min(20, len(component)) if len(component) > 20 else len(component)
+                largest_sample_size = min(20, len(largest_component)) if len(largest_component) > 20 else len(largest_component)
 
-            # Sample a few nodes from each component (not all to avoid timeout)
-            sample_size = min(5, len(component))
-            component_samples = list(component)[:sample_size]
-            largest_samples = list(largest_component)[:sample_size]
+                component_samples = list(component)[:component_sample_size]
+                largest_samples = list(largest_component)[:largest_sample_size]
 
-            for node_a in component_samples:
-                for node_b in largest_samples:
-                    try:
-                        path = nx.shortest_path(full_graph, node_a, node_b, weight='length')
-                        path_length = nx.shortest_path_length(full_graph, node_a, node_b, weight='length')
+                for node_a in component_samples:
+                    for node_b in largest_samples:
+                        try:
+                            path = nx.shortest_path(full_graph, node_a, node_b, weight='length')
+                            path_length = nx.shortest_path_length(full_graph, node_a, node_b, weight='length')
 
-                        if path_length < min_path_length:
-                            min_path_length = path_length
-                            best_path = path
-                    except nx.NetworkXNoPath:
-                        continue
+                            if path_length < min_path_length:
+                                min_path_length = path_length
+                                best_path = path
+                        except nx.NetworkXNoPath:
+                            continue
 
-            if best_path and len(best_path) > 1:
-                # Extract bridge roads from path
-                for i in range(len(best_path) - 1):
-                    edge_data = full_graph.get_edge_data(best_path[i], best_path[i+1])
-                    if edge_data:
-                        bridge_road_id = edge_data.get('road_id')
-                        if bridge_road_id and bridge_road_id not in road_to_idx:
-                            # This road is not in the grid, add it as a bridge
-                            bridge_road = road_lookup.get(bridge_road_id)
-                            if bridge_road:
-                                bridges_added.append(bridge_road)
-                                road_to_idx[bridge_road_id] = len(grid_roads) + len(bridges_added) - 1
+                if best_path and len(best_path) > 1:
+                    # Extract bridge roads from path
+                    for i in range(len(best_path) - 1):
+                        edge_data = full_graph.get_edge_data(best_path[i], best_path[i+1])
+                        if edge_data:
+                            bridge_road_id = edge_data.get('road_id')
+                            if bridge_road_id and bridge_road_id not in road_to_idx:
+                                # This road is not in the grid, add it as a bridge
+                                bridge_road = road_lookup.get(bridge_road_id)
+                                if bridge_road:
+                                    bridges_added.append(bridge_road)
+                                    road_to_idx[bridge_road_id] = len(grid_roads) + len(bridges_added) - 1
+                else:
+                    print(f"    Grid {grid['id']}: WARNING - No path found to connect component {component_idx} ({len(component)} nodes)")
 
-        if bridges_added:
-            grid['roads'].extend(bridges_added)
-            total_bridges_added += len(bridges_added)
-            grids_fixed += 1
-            bridge_miles = sum(r['length_meters'] for r in bridges_added) / 1609.34
-            print(f"    Grid {grid['id']}: Added {len(bridges_added)} bridge roads ({bridge_miles:.2f} mi) to connect components")
+            if bridges_added:
+                grid['roads'].extend(bridges_added)
+                grid_roads = grid['roads']  # Update local reference
+                total_bridges_added += len(bridges_added)
 
-            # Recalculate grid totals
+                bridge_miles = sum(r['length_meters'] for r in bridges_added) / 1609.34
+                print(f"    Grid {grid['id']}: Iteration {iteration}: Added {len(bridges_added)} bridge roads ({bridge_miles:.2f} mi)")
+
+                if iteration == 1:
+                    grids_fixed += 1
+            else:
+                # No bridges found, can't connect further
+                print(f"    Grid {grid['id']}: WARNING - Could not connect all components after {iteration} iterations ({len(components)} components remain)")
+                break
+
+        # Recalculate grid totals after all iterations
+        if grid.get('roads'):
             grid['total_miles'] = sum(r['length_meters'] for r in grid['roads']) / 1609.34
             grid['roads_count'] = len(grid['roads'])
 
