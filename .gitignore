@@ -1,6 +1,9 @@
 # Environment variables
 .env
 
+# GitHub token
+token.md
+
 # SSL certificates and keys
 *.pem
 *.key

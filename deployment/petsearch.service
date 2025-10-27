@@ -1,0 +1,14 @@
+[Unit]
+Description=Pet Search Grid API
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/petsearch
+Environment="PATH=/opt/petsearch/venv/bin"
+ExecStart=/opt/petsearch/venv/bin/gunicorn server_geographic_grids:app -w 4 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8443 --certfile=/etc/letsencrypt/live/api.psar.app/fullchain.pem --keyfile=/etc/letsencrypt/live/api.psar.app/privkey.pem --timeout 300
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
