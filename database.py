@@ -867,6 +867,150 @@ class D1Database:
         result = await self.execute(sql, [search_id, search_id, search_id])
         return result.get('results', [{}])[0] if result.get('results') else {}
 
+    async def save_lost_pet(self, pet_id: str, pet_name: str, pet_photo_url: Optional[str] = None) -> str:
+        """Save or update lost pet information"""
+        import time
+
+        sql = """
+            INSERT INTO lost_pets (pet_id, pet_name, pet_photo_url, created_at, status)
+            VALUES (?, ?, ?, ?, 'lost')
+            ON CONFLICT(pet_id) DO UPDATE SET
+                pet_name = excluded.pet_name,
+                pet_photo_url = excluded.pet_photo_url,
+                updated_at = ?
+        """
+        now = int(time.time())
+        await self.execute(sql, [pet_id, pet_name, pet_photo_url, now, now])
+        return pet_id
+
+    async def complete_search(self, search_id: str, pet_id: str, searcher_id: str,
+                             total_distance_miles: float, duration_minutes: int) -> Dict:
+        """
+        Mark a search as completed and store the final statistics
+        Updates the most recent active assignment for this searcher/search combination
+        """
+        import time
+
+        # Find the most recent active assignment for this searcher and search
+        find_sql = """
+            SELECT assignment_id, status
+            FROM grid_assignments
+            WHERE search_id = ? AND pet_id = ? AND searcher_id = ?
+            ORDER BY assigned_at DESC
+            LIMIT 1
+        """
+        result = await self.execute(find_sql, [search_id, pet_id, searcher_id])
+
+        if not result.get('results') or len(result['results']) == 0:
+            raise Exception(f"No assignment found for searcher {searcher_id} on search {search_id}")
+
+        assignment = result['results'][0]
+        assignment_id = assignment['assignment_id']
+
+        # Update the assignment to mark it as completed
+        update_sql = """
+            UPDATE grid_assignments
+            SET status = 'completed',
+                completed_at = ?,
+                total_distance_miles = ?,
+                duration_minutes = ?,
+                completion_percentage = 100
+            WHERE assignment_id = ?
+        """
+
+        await self.execute(update_sql, [
+            int(time.time()),
+            total_distance_miles,
+            duration_minutes,
+            assignment_id
+        ])
+
+        return {
+            'assignment_id': assignment_id,
+            'search_id': search_id,
+            'pet_id': pet_id,
+            'searcher_id': searcher_id,
+            'total_distance_miles': total_distance_miles,
+            'duration_minutes': duration_minutes
+        }
+
+    async def get_search_history(self, searcher_id: str) -> List[Dict]:
+        """
+        Get search history for a specific searcher
+        Returns all completed search sessions with pet details and GPS routes
+        """
+        # Get all completed assignments for this searcher
+        assignments_sql = """
+            SELECT
+                ga.assignment_id,
+                ga.search_id,
+                ga.pet_id,
+                ga.assigned_at,
+                ga.completed_at,
+                ga.timeframe_minutes,
+                ga.total_distance_miles,
+                ga.duration_minutes,
+                lp.pet_name,
+                lp.pet_photo_url
+            FROM grid_assignments ga
+            LEFT JOIN lost_pets lp ON ga.pet_id = lp.pet_id
+            WHERE ga.searcher_id = ?
+            AND ga.status = 'completed'
+            AND ga.completed_at IS NOT NULL
+            ORDER BY ga.completed_at DESC
+        """
+        assignments_result = await self.execute(assignments_sql, [searcher_id])
+
+        if not assignments_result.get('results'):
+            return []
+
+        search_history = []
+
+        for assignment in assignments_result['results']:
+            assignment_id = assignment['assignment_id']
+
+            # Get GPS route for this assignment
+            route_sql = """
+                SELECT lat, lon, timestamp
+                FROM search_progress
+                WHERE assignment_id = ?
+                ORDER BY timestamp ASC
+            """
+            route_result = await self.execute(route_sql, [assignment_id])
+
+            # Build route array
+            route = []
+            if route_result.get('results'):
+                for point in route_result['results']:
+                    route.append({
+                        'lat': point['lat'],
+                        'lon': point['lon']
+                    })
+
+            # Use stored values from grid_assignments (set by complete_search endpoint)
+            # If not set, fall back to calculating from search_progress or time difference
+            total_distance = assignment.get('total_distance_miles', 0) or 0
+            duration = assignment.get('duration_minutes', 0)
+
+            # If duration is not stored, calculate from timestamps
+            if duration == 0 and assignment.get('completed_at') and assignment.get('assigned_at'):
+                duration = (assignment['completed_at'] - assignment['assigned_at']) // 60
+
+            # Add to history
+            search_history.append({
+                'search_id': assignment['search_id'],
+                'pet_id': assignment['pet_id'],
+                'pet_name': assignment.get('pet_name') or 'Unknown Pet',
+                'pet_photo_url': assignment.get('pet_photo_url'),
+                'searched_at': assignment['assigned_at'],
+                'completed_at': assignment.get('completed_at'),
+                'total_distance_miles': round(total_distance, 2),
+                'duration_minutes': duration,
+                'route': route
+            })
+
+        return search_history
+
 
 # Global database instance
 db = D1Database()

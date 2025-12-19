@@ -884,8 +884,10 @@ def create_grids_from_roads(roads, center_lat, center_lon, target_miles=6, min_m
             print(f"  [SUCCESS] 100% of roads assigned to grids!")
 
     # CONNECTIVITY STEP: Fix disconnected components within grids
-    print(f"\n  [CONNECTIVITY] Checking for disconnected components in {len(grids)} grids...")
-    grids = connect_grid_components(grids, roads)
+    # TEMPORARILY DISABLED due to memory issues with large searches (OOM killer)
+    # TODO: Optimize memory usage or make this optional for large searches
+    print(f"\n  [CONNECTIVITY] Skipping connectivity checking (disabled to prevent OOM)")
+    # grids = connect_grid_components(grids, roads)
 
     return grids
 
@@ -1434,8 +1436,21 @@ async def process_search_grids(search_id: str, request: SearchRequest):
         # Convert miles to meters for Overpass API
         radius_meters = int(download_radius_miles * 1609.34)
 
-        api = overpy.Overpass()
-        query = f"""
+        # Try multiple Overpass servers with fallback to OSMnx
+        overpass_servers = [
+            "https://overpass-api.de/api/interpreter",  # Default (main)
+            "https://overpass.kumi.systems/api/interpreter",  # Alternative 1
+            "https://maps.mail.ru/osm/tools/overpass/api/interpreter",  # Alternative 2
+        ]
+
+        result = None
+        last_error = None
+
+        for server_url in overpass_servers:
+            try:
+                print(f"[OVERPASS] Trying server: {server_url}")
+                api = overpy.Overpass(url=server_url)
+                query = f"""
 [out:json][timeout:{OVERPASS_TIMEOUT}];
 (
   way["highway"](around:{radius_meters},{request.lat},{request.lon});
@@ -1443,55 +1458,89 @@ async def process_search_grids(search_id: str, request: SearchRequest):
 );
 out body;
 """
+                print(f"[OVERPASS] Querying roads within {radius_meters}m radius...")
+                result = api.query(query)
+                print(f"[OVERPASS] SUCCESS! Got {len(result.ways)} ways and {len(result.nodes)} nodes")
+                break  # Success, exit loop
+            except Exception as e:
+                last_error = e
+                print(f"[OVERPASS] Server {server_url} failed: {str(e)}")
+                continue  # Try next server
 
-        print(f"[OVERPASS] Querying roads within {radius_meters}m radius...")
-        result = api.query(query)
-        print(f"[OVERPASS] Got {len(result.ways)} ways and {len(result.nodes)} nodes")
+        # If all Overpass servers failed, fall back to OSMnx
+        if result is None:
+            print(f"[FALLBACK] All Overpass servers failed, falling back to OSMnx...")
+            print(f"[FALLBACK] Last error was: {str(last_error)}")
 
-        # Build NetworkX graph from Overpass result
-        G = nx.MultiDiGraph()
+            try:
+                # Use OSMnx to get the road network
+                print(f"[OSMnx] Downloading road network from OpenStreetMap...")
+                G = ox.graph_from_point(
+                    (request.lat, request.lon),
+                    dist=download_radius_miles * 1609.34,  # Convert miles to meters
+                    network_type='drive',
+                    simplify=False
+                )
+                print(f"[OSMnx] SUCCESS! Got graph with {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
 
-        # Create node lookup
-        node_coords = {}
-        for node in result.nodes:
-            node_coords[node.id] = (node.lat, node.lon)
-            G.add_node(node.id, y=node.lat, x=node.lon)
+                # Convert OSMnx graph format to match Overpass result format for consistency
+                # We'll skip the Overpass result processing and go straight to using the graph
+                result = None  # Signal to skip Overpass processing
 
-        # Add edges from ways
-        for way in result.ways:
-            way_nodes = [node.id for node in way.nodes]
-            highway_type = way.tags.get('highway', 'unknown')
+            except Exception as osmx_error:
+                print(f"[OSMnx] FAILED: {str(osmx_error)}")
+                raise Exception(f"All data sources failed. Overpass: {str(last_error)}, OSMnx: {str(osmx_error)}")
 
-            # Check if road is one-way (default is bidirectional)
-            oneway = way.tags.get('oneway', 'no')
-            is_oneway = oneway in ['yes', 'true', '1', '-1']
+        # Only process Overpass result if we got one (otherwise G is already set by OSMnx)
+        if result is not None:
+            print(f"[OVERPASS] Processing {len(result.ways)} ways and {len(result.nodes)} nodes")
 
-            # Add edges between consecutive nodes
-            for i in range(len(way_nodes) - 1):
-                u, v = way_nodes[i], way_nodes[i+1]
-                if u in node_coords and v in node_coords:
-                    # Calculate edge geometry and length
-                    u_coord = node_coords[u]
-                    v_coord = node_coords[v]
-                    line = LineString([
-                        (u_coord[1], u_coord[0]),  # (lon, lat)
-                        (v_coord[1], v_coord[0])
-                    ])
-                    # Calculate length in meters using geopy (lat/lon degrees to meters)
-                    length_meters = geodesic(u_coord, v_coord).meters
+            # Build NetworkX graph from Overpass result
+            G = nx.MultiDiGraph()
 
-                    # Add forward edge
-                    G.add_edge(u, v, highway=highway_type, geometry=line, length=length_meters, name=way.tags.get('name', ''))
+            # Create node lookup
+            node_coords = {}
+            for node in result.nodes:
+                node_coords[node.id] = (node.lat, node.lon)
+                G.add_node(node.id, y=node.lat, x=node.lon)
 
-                    # Add reverse edge for bidirectional roads (search both sides)
-                    if not is_oneway:
-                        reverse_line = LineString([
-                            (v_coord[1], v_coord[0]),  # (lon, lat)
-                            (u_coord[1], u_coord[0])
+            # Add edges from ways
+            for way in result.ways:
+                way_nodes = [node.id for node in way.nodes]
+                highway_type = way.tags.get('highway', 'unknown')
+
+                # Check if road is one-way (default is bidirectional)
+                oneway = way.tags.get('oneway', 'no')
+                is_oneway = oneway in ['yes', 'true', '1', '-1']
+
+                # Add edges between consecutive nodes
+                for i in range(len(way_nodes) - 1):
+                    u, v = way_nodes[i], way_nodes[i+1]
+                    if u in node_coords and v in node_coords:
+                        # Calculate edge geometry and length
+                        u_coord = node_coords[u]
+                        v_coord = node_coords[v]
+                        line = LineString([
+                            (u_coord[1], u_coord[0]),  # (lon, lat)
+                            (v_coord[1], v_coord[0])
                         ])
-                        G.add_edge(v, u, highway=highway_type, geometry=reverse_line, length=length_meters, name=way.tags.get('name', ''))
+                        # Calculate length in meters using geopy (lat/lon degrees to meters)
+                        length_meters = geodesic(u_coord, v_coord).meters
 
-        print(f"[OVERPASS] Created NetworkX graph with {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+                        # Add forward edge
+                        G.add_edge(u, v, highway=highway_type, geometry=line, length=length_meters, name=way.tags.get('name', ''))
+
+                        # Add reverse edge for bidirectional roads (search both sides)
+                        if not is_oneway:
+                            reverse_line = LineString([
+                                (v_coord[1], v_coord[0]),  # (lon, lat)
+                                (u_coord[1], u_coord[0])
+                            ])
+                            G.add_edge(v, u, highway=highway_type, geometry=reverse_line, length=length_meters, name=way.tags.get('name', ''))
+
+            print(f"[OVERPASS] Created NetworkX graph with {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+        else:
+            print(f"[OSMnx] Using graph with {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
 
         # DEBUG: Check a sample edge for length
         sample_edges = list(G.edges(data=True))[:3]
@@ -1887,6 +1936,18 @@ class UpdateProgressRequest(BaseModel):
     distance_miles: Optional[float] = None  # Cumulative distance traveled in miles
     elapsed_minutes: Optional[int] = None  # Cumulative time elapsed in minutes
 
+class PetDetailsRequest(BaseModel):
+    pet_id: str
+    pet_name: str
+    pet_photo_url: Optional[str] = None
+
+class CompleteSearchRequest(BaseModel):
+    search_id: str
+    pet_id: str
+    searcher_id: str
+    total_distance_miles: float
+    duration_minutes: int
+
 @app.post("/api/get-grids", dependencies=[Depends(verify_api_key)])
 async def get_grids(request: GetGridsRequest):
     """
@@ -2068,6 +2129,109 @@ async def get_grid_status_endpoint(search_id: str):
 
     except Exception as e:
         print(f"Error getting grid status: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/search-history", dependencies=[Depends(verify_api_key)])
+async def get_search_history_endpoint(searcher_id: str):
+    """
+    Get search history for a specific searcher
+    Returns all completed search sessions with pet details and GPS routes
+
+    Query parameter:
+    - searcher_id: Unique identifier for the volunteer searcher
+
+    Returns array of search sessions with:
+    - search_id, pet_id, pet_name, pet_photo_url
+    - searched_at (timestamp when started)
+    - completed_at (timestamp when completed)
+    - total_distance_miles (cumulative distance traveled)
+    - duration_minutes (total time spent searching)
+    - route (array of GPS points with lat/lon)
+    """
+    try:
+        search_history = await db.get_search_history(searcher_id)
+
+        return {
+            'success': True,
+            'searcher_id': searcher_id,
+            'total_searches': len(search_history),
+            'searches': search_history
+        }
+
+    except Exception as e:
+        print(f"Error getting search history: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/save-pet-details", dependencies=[Depends(verify_api_key)])
+async def save_pet_details_endpoint(request: PetDetailsRequest):
+    """
+    Save or update lost pet details (name and photo URL)
+
+    Called by iOS app when user creates or updates a lost pet report
+
+    Request body:
+    - pet_id: Unique identifier for the pet
+    - pet_name: Name of the lost pet
+    - pet_photo_url: URL to pet's photo (optional)
+    """
+    try:
+        pet_id = await db.save_lost_pet(
+            request.pet_id,
+            request.pet_name,
+            request.pet_photo_url
+        )
+
+        return {
+            'success': True,
+            'pet_id': pet_id,
+            'message': 'Pet details saved successfully'
+        }
+
+    except Exception as e:
+        print(f"Error saving pet details: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/complete-search", dependencies=[Depends(verify_api_key)])
+async def complete_search_endpoint(request: CompleteSearchRequest):
+    """
+    Mark a search as completed with final statistics
+
+    Called by iOS app when user finishes searching
+
+    Request body:
+    - search_id: Unique identifier for the search
+    - pet_id: Unique identifier for the pet
+    - searcher_id: Unique identifier for the searcher
+    - total_distance_miles: Total distance traveled during search
+    - duration_minutes: Total time spent searching in minutes
+
+    This marks the search session as completed so it appears in /api/search-history
+    """
+    try:
+        result = await db.complete_search(
+            request.search_id,
+            request.pet_id,
+            request.searcher_id,
+            request.total_distance_miles,
+            request.duration_minutes
+        )
+
+        return {
+            'success': True,
+            'message': 'Search completed and added to history',
+            'assignment_id': result['assignment_id'],
+            'total_distance_miles': result['total_distance_miles'],
+            'duration_minutes': result['duration_minutes']
+        }
+
+    except Exception as e:
+        print(f"Error completing search: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/all-searches")
@@ -2272,6 +2436,606 @@ async def get_search_stats_endpoint(search_id: str):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/retry-search", dependencies=[Depends(verify_api_key)])
+async def retry_failed_search(pet_id: Optional[str] = None, search_id: Optional[str] = None):
+    """
+    Retry a failed search by pet_id or search_id
+
+    This endpoint allows retrying grid generation for searches that failed
+    (e.g., due to Overpass API timeouts or other transient errors)
+
+    Query Parameters (provide one):
+    - pet_id: The pet ID (e.g., "119")
+    - search_id: The search identifier (e.g., "search-XXX")
+
+    Returns:
+    {
+        "success": true,
+        "search_id": "search-XXX",
+        "pet_id": "119",
+        "status": "pending",
+        "message": "Search retry initiated, grids are being regenerated"
+    }
+    """
+    try:
+        # Validate that at least one parameter is provided
+        if not pet_id and not search_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Must provide either pet_id or search_id"
+            )
+
+        # Look up the search
+        if pet_id:
+            sql = "SELECT search_id, pet_id, center_lat, center_lon, radius_miles, grid_size_miles, address, status FROM pet_searches WHERE pet_id = ? ORDER BY created_at DESC LIMIT 1"
+            result = await db.execute(sql, [pet_id])
+        else:
+            sql = "SELECT search_id, pet_id, center_lat, center_lon, radius_miles, grid_size_miles, address, status FROM pet_searches WHERE search_id = ?"
+            result = await db.execute(sql, [search_id])
+
+        if not result.get('results') or len(result['results']) == 0:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No search found for {'pet_id: ' + pet_id if pet_id else 'search_id: ' + search_id}"
+            )
+
+        search = result['results'][0]
+        search_id = search['search_id']
+        current_status = search['status']
+
+        print(f"[{search_id}] Retry requested for pet_id={search['pet_id']}, current status={current_status}")
+
+        # Allow retry for failed, pending, or completed searches
+        # (pending might be stuck, completed might want regeneration)
+        if current_status not in ['failed', 'pending', 'completed']:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot retry search with status '{current_status}'. Only 'failed', 'pending', or 'completed' searches can be retried."
+            )
+
+        # Update status to pending
+        await db.execute(
+            "UPDATE pet_searches SET status = ?, total_grids = ? WHERE search_id = ?",
+            ['pending', 0, search_id]
+        )
+
+        print(f"[{search_id}] Status updated to 'pending', restarting grid generation")
+
+        # Recreate the SearchRequest object from stored data
+        request = SearchRequest(
+            lat=search['center_lat'],
+            lon=search['center_lon'],
+            radius_miles=search['radius_miles'],
+            grid_size_miles=search.get('grid_size_miles', 0.3),
+            address=search.get('address', ''),
+            pet_id=search['pet_id']
+        )
+
+        # Spawn background task to reprocess grids
+        import asyncio
+        asyncio.create_task(process_search_grids(search_id, request))
+
+        print(f"[{search_id}] Background grid processing restarted")
+
+        return {
+            'success': True,
+            'search_id': search_id,
+            'pet_id': search['pet_id'],
+            'status': 'pending',
+            'message': 'Search retry initiated, grids are being regenerated in background'
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error retrying search: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/all-pets")
+async def get_all_pets():
+    """Get all lost pets with their most recent search information"""
+    try:
+        sql = """
+            SELECT
+                lp.pet_id,
+                lp.pet_name,
+                lp.pet_photo_url,
+                lp.created_at,
+                lp.status,
+                ps.search_id,
+                ps.total_grids,
+                ps.created_at as search_created_at
+            FROM lost_pets lp
+            LEFT JOIN pet_searches ps ON lp.pet_id = ps.pet_id
+            ORDER BY lp.created_at DESC
+        """
+        result = await db.execute(sql)
+
+        pets = result.get('results', [])
+
+        return {
+            'success': True,
+            'pets': pets
+        }
+    except Exception as e:
+        print(f"Error getting pets: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/search-grids/{search_id}")
+async def get_search_grids(search_id: str):
+    """Get all grid data for a specific search"""
+    try:
+        # Get basic search info
+        sql = """
+            SELECT search_id, total_grids, created_at, status, pet_id
+            FROM pet_searches
+            WHERE search_id = ?
+        """
+        search_result = await db.execute(sql, [search_id])
+
+        if not search_result.get('results') or len(search_result['results']) == 0:
+            raise HTTPException(status_code=404, detail="Search not found")
+
+        search_info = search_result['results'][0]
+
+        # Get all grid_ids that exist for this search
+        grid_ids_sql = """
+            SELECT grid_id FROM search_grids
+            WHERE search_id = ?
+            ORDER BY grid_id
+        """
+        grid_ids_result = await db.execute(grid_ids_sql, [search_id])
+        grid_ids = [row['grid_id'] for row in grid_ids_result.get('results', [])]
+
+        # Get all grid data
+        grids = []
+        for grid_id in grid_ids:
+            grid_data = await db.get_grid_data(search_id, grid_id)
+            if grid_data:
+                grids.append({
+                    'grid_id': grid_id,
+                    'data': grid_data
+                })
+
+        return {
+            'success': True,
+            'search_id': search_id,
+            'pet_id': search_info['pet_id'],
+            'total_grids': search_info['total_grids'],
+            'grids': grids
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error getting search grids: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/pets")
+async def view_pets_page():
+    """Pet selector page - choose a pet to view their search grids"""
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>View Pet Search Grids</title>
+        <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+        <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+        <style>
+            body { margin: 0; padding: 20px; font-family: Arial; background: #f5f5f5; }
+            .container { max-width: 1400px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            h1 { color: #333; margin-bottom: 10px; }
+            .header { border-bottom: 3px solid #4CAF50; padding-bottom: 20px; margin-bottom: 30px; }
+            .controls {
+                background: #E8F5E9;
+                padding: 20px;
+                border-radius: 8px;
+                margin-bottom: 20px;
+                border: 1px solid #4CAF50;
+            }
+            select {
+                padding: 12px 20px;
+                font-size: 16px;
+                border: 2px solid #4CAF50;
+                border-radius: 6px;
+                width: 100%;
+                max-width: 500px;
+                cursor: pointer;
+                background: white;
+            }
+            select:focus { outline: none; border-color: #45a049; }
+            label {
+                display: block;
+                font-weight: bold;
+                margin-bottom: 10px;
+                color: #333;
+                font-size: 16px;
+            }
+            #map {
+                height: 600px;
+                margin-top: 20px;
+                border: 2px solid #333;
+                border-radius: 8px;
+                display: none;
+            }
+            .info-grid-container {
+                display: flex;
+                gap: 20px;
+                margin: 20px 0;
+            }
+            .info-left {
+                flex: 1;
+            }
+            .info-right {
+                flex: 1;
+            }
+            .pet-info {
+                background: #FFF3E0;
+                padding: 15px;
+                border-radius: 6px;
+                border-left: 4px solid #FF9800;
+                display: none;
+            }
+            .grid-stats {
+                background: #E3F2FD;
+                padding: 15px;
+                border-radius: 6px;
+                margin-top: 10px;
+                border-left: 4px solid #2196F3;
+            }
+            .loading {
+                text-align: center;
+                padding: 20px;
+                font-size: 18px;
+                color: #666;
+            }
+            .error {
+                background: #FFCDD2;
+                padding: 15px;
+                border-radius: 6px;
+                margin: 10px 0;
+                color: #c62828;
+                border-left: 4px solid #c62828;
+            }
+            .grid-selector {
+                display: none;
+            }
+            .grid-selector label {
+                display: block;
+                font-weight: bold;
+                margin-bottom: 10px;
+                color: #333;
+                font-size: 14px;
+            }
+            .grid-selector select {
+                padding: 10px 15px;
+                font-size: 14px;
+                border: 2px solid #2196F3;
+                border-radius: 6px;
+                width: 100%;
+                cursor: pointer;
+                background: white;
+            }
+            .grid-selector select:focus {
+                outline: none;
+                border-color: #1976D2;
+            }
+            .nav-links {
+                margin-top: 20px;
+                padding-top: 20px;
+                border-top: 1px solid #ddd;
+            }
+            .nav-links a {
+                color: #2196F3;
+                text-decoration: none;
+                margin-right: 20px;
+                font-weight: 500;
+            }
+            .nav-links a:hover {
+                text-decoration: underline;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>🐾 View Pet Search Grids</h1>
+                <p style="color: #666; margin: 10px 0 0 0;">Select a pet to view their search grids on the map</p>
+            </div>
+
+            <div class="controls">
+                <label for="petSelect">Select Pet:</label>
+                <select id="petSelect" onchange="loadPetGrids()">
+                    <option value="">-- Choose a pet --</option>
+                </select>
+            </div>
+
+            <div id="loading" class="loading" style="display:none;">Loading grids...</div>
+            <div id="error" class="error" style="display:none;"></div>
+
+            <div class="info-grid-container">
+                <div class="info-left">
+                    <div id="petInfo" class="pet-info"></div>
+                    <div id="gridStats" class="grid-stats" style="display:none;"></div>
+                </div>
+                <div class="info-right">
+                    <div id="gridSelector" class="grid-selector">
+                        <label for="gridSelect">Select Grid to Highlight:</label>
+                        <select id="gridSelect" onchange="selectGridFromDropdown()">
+                            <option value="">-- All grids --</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+
+            <div id="map"></div>
+
+            <div class="nav-links">
+                <a href="/">← Back to Grid Generator</a>
+                <a href="/track">View Active Searches</a>
+            </div>
+        </div>
+
+        <script>
+            let map = null;
+            let gridRectangles = [];
+            let roadPolylines = [];
+
+            // Initialize map
+            function initMap() {
+                if (!map) {
+                    map = L.map('map', {
+                        scrollWheelZoom: true,
+                        zoomControl: true,
+                        doubleClickZoom: true,
+                        touchZoom: true
+                    }).setView([27.8428, -82.8106], 14);
+                    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                        attribution: '© OpenStreetMap contributors',
+                        maxZoom: 19,
+                        minZoom: 10
+                    }).addTo(map);
+                }
+            }
+
+            // Load all pets into dropdown
+            async function loadPets() {
+                try {
+                    const response = await fetch('/api/all-pets');
+                    const data = await response.json();
+
+                    if (data.success && data.pets) {
+                        const select = document.getElementById('petSelect');
+                        select.innerHTML = '<option value="">-- Choose a pet --</option>';
+
+                        data.pets.forEach(pet => {
+                            const option = document.createElement('option');
+                            option.value = JSON.stringify({
+                                pet_id: pet.pet_id,
+                                search_id: pet.search_id,
+                                pet_name: pet.pet_name
+                            });
+                            const searchInfo = pet.search_id ? ` (Search ID: ${pet.search_id.substring(7, 15)}...)` : ' (No search yet)';
+                            option.textContent = `${pet.pet_name} - ID: ${pet.pet_id}${searchInfo}`;
+                            select.appendChild(option);
+                        });
+                    }
+                } catch (error) {
+                    console.error('Error loading pets:', error);
+                    showError('Failed to load pets: ' + error.message);
+                }
+            }
+
+            // Load grids for selected pet
+            async function loadPetGrids() {
+                const select = document.getElementById('petSelect');
+                const selectedValue = select.value;
+
+                if (!selectedValue) {
+                    // Hide everything if no pet selected
+                    document.getElementById('map').style.display = 'none';
+                    document.getElementById('petInfo').style.display = 'none';
+                    document.getElementById('gridStats').style.display = 'none';
+                    document.getElementById('gridSelector').style.display = 'none';
+                    document.getElementById('error').style.display = 'none';
+                    clearMap();
+                    return;
+                }
+
+                const petData = JSON.parse(selectedValue);
+
+                if (!petData.search_id) {
+                    showError('This pet does not have an active search yet.');
+                    return;
+                }
+
+                showLoading(true);
+                hideError();
+                clearMap();
+
+                try {
+                    const response = await fetch(`/api/search-grids/${petData.search_id}`);
+                    const data = await response.json();
+
+                    if (data.success) {
+                        showPetInfo(petData, data);
+                        // Show map container first
+                        document.getElementById('map').style.display = 'block';
+                        // Initialize map after container is visible
+                        initMap();
+                        // Force map to recalculate size
+                        setTimeout(() => {
+                            map.invalidateSize();
+                            displayGrids(data.grids);
+                        }, 100);
+                    } else {
+                        showError('Failed to load grids');
+                    }
+                } catch (error) {
+                    console.error('Error loading grids:', error);
+                    showError('Error loading grids: ' + error.message);
+                } finally {
+                    showLoading(false);
+                }
+            }
+
+            function showPetInfo(petData, searchData) {
+                const infoDiv = document.getElementById('petInfo');
+                const statsDiv = document.getElementById('gridStats');
+
+                infoDiv.innerHTML = `
+                    <strong>Pet:</strong> ${petData.pet_name} (ID: ${petData.pet_id})<br>
+                    <strong>Search ID:</strong> ${searchData.search_id}
+                `;
+                infoDiv.style.display = 'block';
+
+                statsDiv.innerHTML = `
+                    <strong>Total Grids:</strong> ${searchData.total_grids} grid squares created
+                `;
+                statsDiv.style.display = 'block';
+            }
+
+            function displayGrids(grids) {
+                const gridSelect = document.getElementById('gridSelect');
+                const gridSelector = document.getElementById('gridSelector');
+
+                // Reset dropdown
+                gridSelect.innerHTML = '<option value="">-- All grids --</option>';
+
+                grids.forEach(grid => {
+                    const gridData = grid.data;
+
+                    // Draw grid rectangle
+                    const bounds = [
+                        [gridData.bounds.min_lat, gridData.bounds.min_lon],
+                        [gridData.bounds.max_lat, gridData.bounds.max_lon]
+                    ];
+
+                    const rect = L.rectangle(bounds, {
+                        color: '#4CAF50',
+                        weight: 2,
+                        fillOpacity: 0.1
+                    }).addTo(map);
+
+                    rect.gridId = grid.grid_id;
+                    gridRectangles.push(rect);
+
+                    // Draw roads in this grid
+                    const roads = gridData.road_details || [];
+                    if (roads && roads.length > 0) {
+                        roads.forEach(road => {
+                            if (road.waypoints && road.waypoints.length > 1) {
+                                const coords = road.waypoints.map(wp => [wp.lat, wp.lon]);
+                                const polyline = L.polyline(coords, {
+                                    color: '#2196F3',
+                                    weight: 3,
+                                    opacity: 0.7
+                                }).addTo(map);
+                                polyline.gridId = grid.grid_id;
+                                roadPolylines.push(polyline);
+                            }
+                        });
+                    }
+
+                    // Add to dropdown
+                    const roadCount = gridData.road_count || roads.length;
+                    const distance = gridData.total_distance_miles ? gridData.total_distance_miles.toFixed(2) : '0';
+                    const option = document.createElement('option');
+                    option.value = grid.grid_id;
+                    option.textContent = `Grid ${grid.grid_id} - ${roadCount} roads (${distance} miles)`;
+                    gridSelect.appendChild(option);
+                });
+
+                // Show dropdown
+                gridSelector.style.display = 'block';
+
+                // Fit map to show all grids with better zoom
+                if (gridRectangles.length > 0) {
+                    const group = new L.featureGroup(gridRectangles);
+                    map.fitBounds(group.getBounds(), {
+                        padding: [50, 50],
+                        maxZoom: 15
+                    });
+                }
+            }
+
+            function selectGridFromDropdown() {
+                const gridSelect = document.getElementById('gridSelect');
+                const selectedGridId = gridSelect.value;
+
+                if (selectedGridId === '') {
+                    // Reset all to default
+                    gridRectangles.forEach(rect => {
+                        rect.setStyle({ color: '#4CAF50', weight: 2 });
+                    });
+                    roadPolylines.forEach(line => {
+                        line.setStyle({ color: '#2196F3', weight: 3, opacity: 0.7 });
+                    });
+                } else {
+                    highlightGrid(parseInt(selectedGridId));
+                }
+            }
+
+            function highlightGrid(gridId) {
+                // Reset all styles
+                gridRectangles.forEach(rect => {
+                    rect.setStyle({ color: '#4CAF50', weight: 2 });
+                });
+                roadPolylines.forEach(line => {
+                    line.setStyle({ color: '#2196F3', weight: 3, opacity: 0.7 });
+                });
+
+                // Highlight selected grid
+                gridRectangles.forEach(rect => {
+                    if (rect.gridId === gridId) {
+                        rect.setStyle({ color: '#FFD700', weight: 5 });
+                    }
+                });
+                roadPolylines.forEach(line => {
+                    if (line.gridId === gridId) {
+                        line.setStyle({ color: '#FF6B6B', weight: 5, opacity: 1 });
+                    }
+                });
+            }
+
+            function clearMap() {
+                if (map) {
+                    gridRectangles.forEach(rect => map.removeLayer(rect));
+                    roadPolylines.forEach(line => map.removeLayer(line));
+                    gridRectangles = [];
+                    roadPolylines = [];
+                    // Reset map view
+                    map.setView([27.8428, -82.8106], 13);
+                }
+            }
+
+            function showLoading(show) {
+                document.getElementById('loading').style.display = show ? 'block' : 'none';
+            }
+
+            function showError(message) {
+                const errorDiv = document.getElementById('error');
+                errorDiv.textContent = message;
+                errorDiv.style.display = 'block';
+            }
+
+            function hideError() {
+                document.getElementById('error').style.display = 'none';
+            }
+
+            // Load pets on page load
+            loadPets();
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html)
 
 @app.get("/track")
 async def track_searchers():
