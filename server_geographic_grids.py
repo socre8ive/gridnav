@@ -61,6 +61,7 @@ class SearchRequest(BaseModel):
     grid_size_miles: float = 0.5  # Size of each grid square
     address: Optional[str] = None
     pet_id: Optional[str] = None  # For iOS app tracking
+    force_regenerate: bool = False  # If True, delete old grids and regenerate at new location
 
 def is_definitely_fake(edge, coords, edge_data):
     """
@@ -1809,38 +1810,107 @@ out body;
 
 @app.post("/api/create-search", dependencies=[Depends(verify_api_key)])
 async def create_search(request: SearchRequest):
-    """Accept search request and return immediately, process grids in background"""
+    """Accept search request and return immediately, process grids in background.
+
+    If force_regenerate=True and pet_id already exists:
+    - Updates the search center to new coordinates
+    - Deletes all old grids
+    - Regenerates grids at new location (e.g., after confirmed sighting)
+    """
     try:
-        search_id = f"search-{uuid.uuid4()}"
-
-        print(f"[{search_id}] Received search request for pet_id={request.pet_id}")
-
-        # Save basic search record immediately with status='pending'
-        await db.create_search_tracking(
-            search_id,
-            request.pet_id,
-            request.address or f"{request.lat}, {request.lon}",
-            request.lat,
-            request.lon,
-            request.radius_miles,
-            0  # total_grids will be updated when processing completes
-        )
-
-        print(f"[{search_id}] Saved to database with status='pending'")
-
-        # Spawn background task to process grids (fire and forget)
         import asyncio
-        asyncio.create_task(process_search_grids(search_id, request))
 
-        print(f"[{search_id}] Background grid processing started")
+        # Check if search already exists for this pet_id
+        existing_search = None
+        if request.pet_id:
+            existing_search = await db.get_search_by_pet_id(request.pet_id)
 
-        # Return success immediately
-        return {
-            'success': True,
-            'search_id': search_id,
-            'status': 'pending',
-            'message': 'Search accepted, grids are being generated in background'
-        }
+        if existing_search and request.force_regenerate:
+            # FORCE REGENERATE: Update existing search with new location
+            search_id = existing_search['search_id']
+            old_lat = existing_search.get('center_lat')
+            old_lon = existing_search.get('center_lon')
+
+            print(f"[{search_id}] FORCE REGENERATE for pet_id={request.pet_id}")
+            print(f"[{search_id}] Old location: ({old_lat}, {old_lon})")
+            print(f"[{search_id}] New location: ({request.lat}, {request.lon})")
+
+            # Delete old grids
+            delete_result = await db.execute(
+                "DELETE FROM search_grids WHERE search_id = ?",
+                [search_id]
+            )
+            print(f"[{search_id}] Deleted old grids")
+
+            # Update search record with new center coordinates and reset status
+            await db.execute(
+                """UPDATE pet_searches
+                   SET center_lat = ?, center_lon = ?, address = ?,
+                       radius_miles = ?, status = 'pending', total_grids = 0
+                   WHERE search_id = ?""",
+                [request.lat, request.lon,
+                 request.address or f"{request.lat}, {request.lon}",
+                 request.radius_miles, search_id]
+            )
+            print(f"[{search_id}] Updated search record with new coordinates")
+
+            # Spawn background task to regenerate grids
+            asyncio.create_task(process_search_grids(search_id, request))
+
+            print(f"[{search_id}] Background grid regeneration started")
+
+            return {
+                'success': True,
+                'search_id': search_id,
+                'status': 'pending',
+                'force_regenerated': True,
+                'old_location': {'lat': old_lat, 'lon': old_lon},
+                'new_location': {'lat': request.lat, 'lon': request.lon},
+                'message': 'Search recentered, grids are being regenerated at new location'
+            }
+
+        elif existing_search and not request.force_regenerate:
+            # Search exists but force_regenerate not set - return existing search info
+            print(f"[{existing_search['search_id']}] Search already exists for pet_id={request.pet_id}, force_regenerate=False")
+            return {
+                'success': True,
+                'search_id': existing_search['search_id'],
+                'status': existing_search.get('status', 'unknown'),
+                'already_exists': True,
+                'message': 'Search already exists for this pet. Use force_regenerate=true to recenter at new location.'
+            }
+
+        else:
+            # NEW SEARCH: Create new search record
+            search_id = f"search-{uuid.uuid4()}"
+
+            print(f"[{search_id}] Received search request for pet_id={request.pet_id}")
+
+            # Save basic search record immediately with status='pending'
+            await db.create_search_tracking(
+                search_id,
+                request.pet_id,
+                request.address or f"{request.lat}, {request.lon}",
+                request.lat,
+                request.lon,
+                request.radius_miles,
+                0  # total_grids will be updated when processing completes
+            )
+
+            print(f"[{search_id}] Saved to database with status='pending'")
+
+            # Spawn background task to process grids (fire and forget)
+            asyncio.create_task(process_search_grids(search_id, request))
+
+            print(f"[{search_id}] Background grid processing started")
+
+            # Return success immediately
+            return {
+                'success': True,
+                'search_id': search_id,
+                'status': 'pending',
+                'message': 'Search accepted, grids are being generated in background'
+            }
 
     except Exception as e:
         print(f"Error creating search: {str(e)}")
@@ -1947,6 +2017,11 @@ class CompleteSearchRequest(BaseModel):
     searcher_id: str
     total_distance_miles: float
     duration_minutes: int
+
+class UpdateSearchCenterRequest(BaseModel):
+    search_id: str
+    latitude: float
+    longitude: float
 
 @app.post("/api/get-grids", dependencies=[Depends(verify_api_key)])
 async def get_grids(request: GetGridsRequest):
@@ -2191,6 +2266,57 @@ async def save_pet_details_endpoint(request: PetDetailsRequest):
 
     except Exception as e:
         print(f"Error saving pet details: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/update-search-center", dependencies=[Depends(verify_api_key)])
+async def update_search_center_endpoint(request: UpdateSearchCenterRequest):
+    """
+    Update the center point used for grid assignment prioritization.
+
+    Called when a sighting is confirmed within the existing search radius.
+    Does NOT regenerate grids - just changes which grids are assigned first.
+
+    Request body:
+    - search_id: The search to update
+    - latitude: New center latitude (e.g., confirmed sighting location)
+    - longitude: New center longitude
+    """
+    try:
+        # Get current center for response
+        sql = "SELECT center_lat, center_lon FROM pet_searches WHERE search_id = ?"
+        result = await db.execute(sql, [request.search_id])
+
+        if not result.get('results') or len(result['results']) == 0:
+            raise HTTPException(status_code=404, detail=f"Search not found: {request.search_id}")
+
+        previous = result['results'][0]
+        previous_center = {
+            "lat": previous['center_lat'],
+            "lon": previous['center_lon']
+        }
+
+        # Update the center point
+        update_sql = "UPDATE pet_searches SET center_lat = ?, center_lon = ? WHERE search_id = ?"
+        await db.execute(update_sql, [request.latitude, request.longitude, request.search_id])
+
+        print(f"[{request.search_id}] Updated search center from ({previous_center['lat']}, {previous_center['lon']}) to ({request.latitude}, {request.longitude})")
+
+        return {
+            'success': True,
+            'search_id': request.search_id,
+            'previous_center': previous_center,
+            'new_center': {
+                "lat": request.latitude,
+                "lon": request.longitude
+            }
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error updating search center: {str(e)}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))

@@ -326,6 +326,22 @@ class D1Database:
         ])
         return search_id
 
+    async def get_search_by_pet_id(self, pet_id: str) -> Optional[Dict]:
+        """Look up a search by pet_id. Returns the most recent search for this pet."""
+        sql = """
+            SELECT search_id, pet_id, address, center_lat, center_lon,
+                   radius_miles, grid_size_miles, total_grids, created_at, status
+            FROM pet_searches
+            WHERE pet_id = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+        """
+        result = await self.execute(sql, [pet_id])
+
+        if result.get('results') and len(result['results']) > 0:
+            return result['results'][0]
+        return None
+
     async def assign_grid(self, search_id: str, pet_id: str, grid_id: int,
                          searcher_id: str, searcher_name: str, timeframe_minutes: int) -> Dict:
         """Assign a grid to a searcher"""
